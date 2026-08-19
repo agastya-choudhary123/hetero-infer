@@ -59,6 +59,53 @@ link is free." The weak Wi-Fi row is far above it and is real.
 
 ---
 
+## Two machines, for real
+
+An M4 MacBook Pro and a 2013 Intel MacBook Pro, over home Wi-Fi. The Intel
+machine cannot run MLX at all — it runs the NumPy backend with a fused int4
+kernel — and it is 19x slower per layer. The pool still runs a model neither
+machine is allowed to hold:
+
+```
+link measured: 47 Mbps, 8.4 ms RTT
+[M4 laptop]       394 us/layer  [mlx]
+[2013 Intel]     7725 us/layer  [numpy+q4]
+
+plan[latency, head on stage 0]   predicted 125.13 ms/token
+  stage 0  M4 laptop   layers  0-13 (14)  0.52 GiB / 0.53 GiB  embed head
+  stage 1  2013 Intel  layers 14-27 (14)  0.40 GiB / 0.53 GiB
+
+prompt 8 tok | TTFT 994 ms | 32 tokens | 8.07 tok/s
+```
+
+Model is 0.81 GiB; each node was capped at 0.53 GiB, so neither could hold it.
+Measured 8.07 tok/s against 8.0 predicted.
+
+Two things make this work at all.
+
+**The output projection is a placement decision, not a fixed position.** The
+vocabulary matmul is 152k wide: 1.7 ms on the M4's GPU, 853 ms on the CPU
+backend. Pinning it to the last stage would have made the old Mac's head
+dominate everything. Instead the planner chooses, and when it picks stage 0 the
+ring returns hidden states rather than a token id.
+
+**A fused int4 GEMV, because decode is bandwidth-bound.** Dequantising 4-bit
+weights to float32 at load moves eight times the bytes per token. The kernel in
+`kernel/q4gemv.c` unpacks into registers instead, with AVX2 and NEON paths:
+
+```
+                          M4 (NEON, 8 thr)     2013 Intel (AVX2, 4 thr)
+NumPy float32 GEMV            0.81 ms                3.75 ms
+fused int4 GEMV               0.28 ms  (2.9x)        1.69 ms  (2.2x)
+```
+
+It matches the NumPy path to 3e-7 and generates identical tokens. The larger
+win is memory: weights stay packed, so a CPU node holds **8x more layers**.
+
+Short prefills go through the same kernel row by row rather than dequantising
+for BLAS, which is what a chat-length prompt actually wants — that alone took
+TTFT on this pair from 9.8 s to 0.99 s.
+
 ## Three findings worth the trouble
 
 **1. A slow link makes your compute slower too.** The `clock drop` column is not
@@ -255,12 +302,17 @@ exactly.
 
 ## Caveats
 
-**The two-machine case is not measured end to end.** Every number here comes
-from two (or three) processes on one M4. The protocol, the planner, the
-self-profiling handshake and the launchers are all written for real boxes, and
-`pool.sh` was exercised end to end against a stand-in for the remote side, but
-the real `ssh`/`rsync` hop over a LAN has never run. Treat the two-machine path
-as unverified against real hardware until you run it.
+**Which numbers come from where.** The link sweep, codec, concurrency and
+prefill tables are two processes on one M4 with an emulated link. The
+two-machine section is real hardware over real Wi-Fi. The 7B numbers are
+single-machine; the cross-machine run used the 1.5B, because 28 layers of a 7B
+on a 2013 CPU is a slideshow regardless of how good the kernel is.
+
+**A slow node cannot make generation faster.** Pipeline parallelism splits
+memory, not work — every token still crosses every layer in order. Given a free
+choice, the partitioner assigns a much slower node zero layers, which is the
+correct answer. That node earns its place only when the model does not fit
+without it.
 
 **Sharing one GPU understates concurrency.** Both stages contend for the same
 GPU here, so they cannot truly compute at once. That is why loopback throughput
