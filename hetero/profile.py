@@ -10,9 +10,7 @@ import subprocess
 import time
 from typing import Tuple
 
-import mlx.core as mx
-
-from .model import KVCache, load_stage
+from . import backends
 from .planner import NodeProfile
 from .shard import ShardSpec, WeightIndex
 
@@ -27,76 +25,86 @@ def auto_mem_budget(fraction: float = 0.65) -> int:
     return int(system_memory() * fraction)
 
 
-def _time_decode(stage, caches, x, iters: int = 24, warmup: int = 6) -> float:
+def _time_decode(stage, caches, x, backend, iters: int = 24, warmup: int = 6) -> float:
     for _ in range(warmup):
-        y = stage(x, caches)
-        mx.eval(y)
-    mx.synchronize()
+        backend.eval(stage(x, caches))
     t0 = time.perf_counter()
     for _ in range(iters):
-        y = stage(x, caches)
-        mx.eval(y)
-    mx.synchronize()
+        backend.eval(stage(x, caches))
     return (time.perf_counter() - t0) / iters
 
 
-def _time_bare(fn, iters: int = 24, warmup: int = 6) -> float:
+def _time_bare(fn, backend, iters: int = 24, warmup: int = 6) -> float:
     for _ in range(warmup):
-        mx.eval(fn())
-    mx.synchronize()
+        backend.eval(fn())
     t0 = time.perf_counter()
     for _ in range(iters):
-        mx.eval(fn())
-    mx.synchronize()
+        backend.eval(fn())
     return (time.perf_counter() - t0) / iters
 
 
 def measure_node(model_dir: str, name: str = "local", probe_layers: int = 4,
-                 mem_bytes: int = 0, ctx_warm: int = 256) -> NodeProfile:
-    """Time a probe shard on this machine. Frees each shard before the next."""
+                 mem_bytes: int = 0, ctx_warm: int = 256, backend=None) -> NodeProfile:
+    """Time this machine's three costs directly: layers, embedding, output head.
+
+    Each is measured on a shard that contains only that part, rather than by
+    differencing two larger measurements. On a slow CPU node the output
+    projection costs hundreds of milliseconds while a layer costs tens, and
+    subtracting one from the other loses the layer cost entirely in the noise —
+    which makes the partitioner believe that node's layers are free.
+    """
+    backend = backend or backends.get("auto")
+    slow = backend.name != "mlx"
+    if slow:
+        probe_layers = min(probe_layers, 2)
     index = WeightIndex(model_dir)
-    L = index.config["num_hidden_layers"]
-    probe_layers = min(probe_layers, L)
-    ids = mx.array([[151643]])
+    cfg = index.config
+    L = cfg["num_hidden_layers"]
+    probe_layers = max(min(probe_layers, L), 1)
+    D = cfg["hidden_size"]
+    iters, warm = (4, 2) if slow else (24, 6)
+    pf_iters, pf_warm = (2, 1) if slow else (6, 2)
+    pf_tokens = 32 if slow else 256
 
-    # embed + head only: the fixed per-step cost, and the embed half of it
-    s0, _ = load_stage(model_dir, ShardSpec(0, 0, True, True), index)
-    t_fixed = _time_decode(s0, [], ids)
-    t_embed = _time_bare(lambda: s0.embed(ids))
-    chunk = mx.array([[151643] * 256])
-    t_fixed_prefill = _time_bare(lambda: s0(chunk, []), iters=6, warmup=2)
-    del s0
-    mx.clear_cache()
+    # decoder layers only: no embedding, no output projection
+    s_layers, _ = backend.load_stage(model_dir, ShardSpec(0, probe_layers, False, False), index)
+    caches = backend.new_caches(probe_layers)
+    backend.eval(s_layers(backend.hidden((1, min(ctx_warm, 64) if slow else ctx_warm, D)), caches))
+    one = backend.hidden((1, 1, D))
+    t_layer = _time_bare(lambda: s_layers(one, caches), backend, iters, warm) / probe_layers
 
-    # embed + k layers + head: adds k layers of work
-    spec = ShardSpec(0, probe_layers, True, True)
-    s1, _ = load_stage(model_dir, spec, index)
-    caches = [KVCache() for _ in range(probe_layers)]
-    warm = mx.array([[151643] * ctx_warm])
-    mx.eval(s1(warm, caches))          # populate cache so decode sees real context
-    t_k = _time_decode(s1, caches, ids)
+    chunk = backend.hidden((1, pf_tokens, D))
+    t_pref = _time_bare(lambda: s_layers(chunk, backend.new_caches(probe_layers)),
+                        backend, pf_iters, pf_warm) / (pf_tokens * probe_layers)
+    del s_layers, caches
+    backend.clear_cache()
 
-    # prefill: difference the same 256-token chunk against the 0-layer stage,
-    # then divide out both tokens and layers
-    def prefill_once():
-        return s1(chunk, [KVCache() for _ in range(probe_layers)])
-    t_prefill = _time_bare(prefill_once, iters=6, warmup=2)
-    del s1, caches
-    mx.clear_cache()
+    # embedding lookup only
+    s_embed, _ = backend.load_stage(model_dir, ShardSpec(0, 0, True, False), index)
+    ids = backend.array([[151643]])
+    t_embed = _time_bare(lambda: s_embed.embed(ids), backend, iters, warm)
+    del s_embed
+    backend.clear_cache()
 
-    per_layer = max((t_k - t_fixed) / probe_layers, 1e-9)
-    per_tok_layer = max((t_prefill - t_fixed_prefill) / (256 * probe_layers), 1e-12)
+    # final norm + vocabulary projection only
+    s_head, _ = backend.load_stage(model_dir, ShardSpec(0, 0, False, True), index)
+    t_head = _time_bare(lambda: s_head(one, [], last_only=True), backend, iters, warm)
+    del s_head
+    backend.clear_cache()
+
     return NodeProfile(
         name=name,
         mem_bytes=mem_bytes or auto_mem_budget(),
-        decode_s_per_layer=per_layer,
-        prefill_s_per_layer_token=per_tok_layer,
+        decode_s_per_layer=max(t_layer, 1e-9),
+        prefill_s_per_layer_token=max(t_pref, 1e-12),
         embed_s=t_embed,
-        head_s=max(t_fixed - t_embed, 0.0),
+        head_s=t_head,
+        backend=backend.name,
+        weight_expansion=backend.weight_expansion,
     )
 
 
-def probe_link(chan, rounds: int = 40, payload_mb: float = 8.0) -> Tuple[float, float]:
+def probe_link(chan, rounds: int = 12, payload_mb: float = 1.0) -> Tuple[float, float]:
     """Initiator side: returns (rtt_ms, bandwidth_mbps). Peer must run echo_link."""
     rtts = []
     for i in range(rounds):
@@ -107,6 +115,8 @@ def probe_link(chan, rounds: int = 40, payload_mb: float = 8.0) -> Tuple[float, 
     rtts.sort()
     rtt_ms = rtts[len(rtts) // 2] * 1e3
 
+    # Keep this small. A slow link and a slow peer turn a large probe into
+    # minutes of startup, and one megabyte already resolves a home network.
     blob = b"\0" * int(payload_mb * 1e6)
     t0 = time.perf_counter()
     chan.send({"t": "bw"}, blob)

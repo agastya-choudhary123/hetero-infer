@@ -195,13 +195,13 @@ def connect(host: str, port: int, retries: int = 200, delay: float = 0.05) -> so
 # at the cost of a per-row scale and a small amount of error; whether that is a
 # win depends entirely on whether the link is bandwidth- or latency-bound.
 
-def encode(arr, codec: str = "fp16") -> Tuple[dict, bytes]:
-    import mlx.core as mx
+def encode(arr: np.ndarray, codec: str = "fp16") -> Tuple[dict, bytes]:
+    """Takes a numpy array (backends convert), returns (header, payload)."""
     if codec == "fp16":
-        a = np.array(arr.astype(mx.float16), copy=False)
+        a = np.asarray(arr, dtype=np.float16)
         return {"codec": "fp16", "shape": list(a.shape)}, a.tobytes()
     if codec == "int8":
-        a = np.array(arr.astype(mx.float32), copy=False)
+        a = np.asarray(arr, dtype=np.float32)
         flat = a.reshape(-1, a.shape[-1])
         scale = np.abs(flat).max(axis=-1, keepdims=True) / 127.0
         scale[scale == 0] = 1.0
@@ -211,16 +211,15 @@ def encode(arr, codec: str = "fp16") -> Tuple[dict, bytes]:
     raise ValueError(f"unknown codec {codec}")
 
 
-def decode(header: dict, payload: bytes):
-    import mlx.core as mx
+def decode(header: dict, payload: bytes) -> np.ndarray:
+    """Returns a numpy array; the backend lifts it to its own array type."""
     shape = tuple(header["shape"])
     if header["codec"] == "fp16":
-        a = np.frombuffer(payload, dtype=np.float16).reshape(shape)
-        return mx.array(a)
+        return np.frombuffer(payload, dtype=np.float16).reshape(shape)
     if header["codec"] == "int8":
         rows = int(np.prod(shape[:-1]))
         nsc = rows * 4
         scale = np.frombuffer(payload[:nsc], dtype=np.float32).reshape(rows, 1)
         q = np.frombuffer(payload[nsc:], dtype=np.int8).reshape(rows, shape[-1])
-        return mx.array((q.astype(np.float32) * scale).reshape(shape).astype(np.float16))
+        return (q.astype(np.float32) * scale).reshape(shape).astype(np.float16)
     raise ValueError(f"unknown codec {header['codec']}")

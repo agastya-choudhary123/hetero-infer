@@ -34,6 +34,8 @@ class NodeProfile:
     prefill_s_per_layer_token: float = 0.0
     embed_s: float = 0.0               # embedding lookup per decode step
     head_s: float = 0.0                # final norm + lm_head per decode step
+    backend: str = "mlx"
+    weight_expansion: float = 1.0      # layer bytes in memory / bytes on disk
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -57,6 +59,7 @@ class LinkSpec:
 class Plan:
     cuts: List[int]                    # length N+1, cuts[0]=0, cuts[-1]=L
     nodes: List[NodeProfile]
+    head_node: int = -1                # which stage owns the vocabulary projection
     specs: List[ShardSpec] = field(default_factory=list)
     objective: str = "throughput"
     predicted_decode_s: float = 0.0
@@ -72,12 +75,12 @@ class Plan:
         return d
 
     def describe(self) -> str:
-        lines = [f"plan[{self.objective}]  predicted {self.predicted_decode_s * 1e3:.2f} ms/token "
+        lines = [f"plan[{self.objective}, head on stage {self.head_node}]  predicted {self.predicted_decode_s * 1e3:.2f} ms/token "
                  f"({1.0 / self.predicted_decode_s:.1f} tok/s)"]
         for i, (n, s) in enumerate(zip(self.nodes, self.specs)):
             tag = ("embed " if s.embed else "") + ("head" if s.head else "")
             lines.append(
-                f"  stage {i} {n.name:<10} layers {s.start:>3}-{s.end - 1:<3} "
+                f"  stage {i} {n.name:<10} [{n.backend:>5}] layers {s.start:>3}-{s.end - 1:<3} "
                 f"({s.n_layers:>2})  mem {self.stage_mem_bytes[i] / 2**30:5.2f} GiB / "
                 f"{n.mem_bytes / 2**30:5.2f} GiB  compute {self.stage_compute_s[i] * 1e3:6.2f} ms  "
                 f"comm {self.stage_comm_s[i] * 1e3:5.2f} ms {tag}")
@@ -97,8 +100,10 @@ def hidden_bytes(cfg: dict, tokens: int = 1, batch: int = 1, codec: str = "fp16"
     return batch * tokens * d * 2
 
 
-def _stage_mem(index: WeightIndex, spec: ShardSpec, kv_per_layer: int) -> int:
-    return index.shard_bytes(spec) + spec.n_layers * kv_per_layer
+def _stage_mem(index: WeightIndex, spec: ShardSpec, kv_per_layer: int,
+               expansion: float = 1.0) -> int:
+    from .engine import resident_bytes
+    return resident_bytes(index, spec, expansion) + spec.n_layers * kv_per_layer
 
 
 def _stage_time(node: NodeProfile, spec: ShardSpec) -> float:
@@ -113,7 +118,32 @@ def _stage_time(node: NodeProfile, spec: ShardSpec) -> float:
 def plan_pipeline(index: WeightIndex, nodes: List[NodeProfile], link: LinkSpec,
                   objective: str = "throughput", max_ctx: int = 4096,
                   batch: int = 1, codec: str = "fp16") -> Plan:
-    """DP over cut points. Returns the best feasible plan or raises."""
+    """Choose where the head lives, then where to cut.
+
+    The ring returns to stage 0 either way, so the output projection can sit on
+    the last stage (which then returns a token id) or on stage 0 (which then
+    gets hidden states back and projects them itself). On a mixed pool that
+    choice dominates: the vocabulary matmul costs milliseconds on a GPU and
+    most of a second on a CPU, so it belongs on the fastest node.
+    """
+    best_plan, best_cost = None, float("inf")
+    for head_at in ({len(nodes) - 1, 0} if len(nodes) > 1 else {len(nodes) - 1}):
+        try:
+            p = _plan_with_head(index, nodes, link, head_at, objective, max_ctx, batch, codec)
+        except MemoryError as e:
+            last_err = e
+            continue
+        if p.predicted_decode_s < best_cost:
+            best_plan, best_cost = p, p.predicted_decode_s
+    if best_plan is None:
+        raise last_err
+    return best_plan
+
+
+def _plan_with_head(index: WeightIndex, nodes: List[NodeProfile], link: LinkSpec,
+                    head_at: int, objective: str = "throughput", max_ctx: int = 4096,
+                    batch: int = 1, codec: str = "fp16") -> Plan:
+    """DP over cut points for one head placement."""
     cfg = index.config
     L = int(cfg["num_hidden_layers"])
     N = len(nodes)
@@ -124,6 +154,7 @@ def plan_pipeline(index: WeightIndex, nodes: List[NodeProfile], link: LinkSpec,
     # Cost of shipping one activation payload to the next stage.
     act = hidden_bytes(cfg, tokens=1, batch=batch, codec=codec)
     comm = link.seconds_for(act + 96)   # +header
+    ret_comm = link.seconds_for(96)     # a token id is a handful of bytes
 
     INF = float("inf")
     # best[i][c] = cost of assigning layers [c:] to nodes i.. ; choose cut c2
@@ -140,18 +171,20 @@ def plan_pipeline(index: WeightIndex, nodes: List[NodeProfile], link: LinkSpec,
             for c2 in range(c, L + 1):
                 if best[i + 1][c2] == INF:
                     continue
-                spec = ShardSpec(c, c2, i == 0, i == N - 1)
-                if _stage_mem(index, spec, kv) > node.mem_bytes:
+                spec = ShardSpec(c, c2, i == 0, i == head_at)
+                if _stage_mem(index, spec, kv, node.weight_expansion) > node.mem_bytes:
                     continue
-                # last stage sends only a sampled token id back to the head
-                out = 0.0 if i == N - 1 else comm
+                # The last stage returns a token id if it owns the head, and a
+                # full hidden state if stage 0 owns it instead.
+                out = (comm if head_at == 0 else ret_comm) if i == N - 1 else comm
                 cost = combine(_stage_time(node, spec) + out, best[i + 1][c2])
                 # Ties are common (equal-speed nodes make the latency objective
                 # indifferent to where the cut falls). Break them toward the
                 # split that leaves the most memory headroom, since KV cache
                 # grows into it as context does. The high power makes a stage
                 # that is nearly full much worse than two half-full ones.
-                cost += 1e-12 * (_stage_mem(index, spec, kv) / node.mem_bytes) ** 8
+                cost += 1e-12 * (_stage_mem(index, spec, kv, node.weight_expansion)
+                                 / node.mem_bytes) ** 8
                 if cost < best[i][c]:
                     best[i][c] = cost
                     choice[i][c] = c2
@@ -168,19 +201,19 @@ def plan_pipeline(index: WeightIndex, nodes: List[NodeProfile], link: LinkSpec,
         c = choice[i][c]
         cuts.append(c)
 
-    specs = [ShardSpec(cuts[i], cuts[i + 1], i == 0, i == N - 1) for i in range(N)]
-    plan = Plan(cuts=cuts, nodes=nodes, specs=specs, objective=objective)
+    specs = [ShardSpec(cuts[i], cuts[i + 1], i == 0, i == head_at) for i in range(N)]
+    plan = Plan(cuts=cuts, nodes=nodes, specs=specs, objective=objective, head_node=head_at)
     plan.stage_compute_s = [_stage_time(n, s) for n, s in zip(nodes, specs)]
-    plan.stage_comm_s = [0.0 if i == N - 1 else comm for i in range(N)]
+    plan.stage_comm_s = [(comm if head_at == 0 else ret_comm) if i == N - 1 else comm
+                         for i in range(N)]
     plan.stage_bytes = [index.shard_bytes(s) for s in specs]
-    plan.stage_mem_bytes = [_stage_mem(index, s, kv) for s in specs]
-    # Round trip of the token id back to stage 0 is paid once per step either way.
-    ret = link.seconds_for(96)
+    plan.stage_mem_bytes = [_stage_mem(index, s, kv, n.weight_expansion)
+                            for n, s in zip(nodes, specs)]
     if objective == "throughput":
         plan.predicted_decode_s = max(c + m for c, m in
-                                      zip(plan.stage_compute_s, plan.stage_comm_s)) + ret
+                                      zip(plan.stage_compute_s, plan.stage_comm_s))
     else:
-        plan.predicted_decode_s = sum(plan.stage_compute_s) + sum(plan.stage_comm_s) + ret
+        plan.predicted_decode_s = sum(plan.stage_compute_s) + sum(plan.stage_comm_s)
     return plan
 
 

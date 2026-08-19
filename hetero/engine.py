@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+
+import numpy as np
 from typing import Dict, List, Optional
 
-import mlx.core as mx
-
-from .model import KVCache, Stage, load_stage
+from . import backends
 from .shard import ShardSpec, WeightIndex
 from .transport import Channel, decode, encode
 
@@ -39,10 +39,14 @@ class StageStats:
 class StageRunner:
     """Owns one shard, its caches, and the loop that services frames."""
 
-    def __init__(self, stage: Stage, spec: ShardSpec, n_layers_total: int,
+    def __init__(self, stage, spec: ShardSpec, n_layers_total: int,
                  codec: str = "fp16", sampler: Optional["Sampler"] = None,
-                 name: str = "stage"):
+                 name: str = "stage", backend=None, body_only: bool = False):
         self.name = name
+        # Stage 0 owns the head in a mixed pool, but must not apply it on the
+        # way out — only when the hidden state comes back around the ring.
+        self.body_only = body_only
+        self.backend = backend or backends.get("auto")
         self.stage = stage
         self.spec = spec
         self.n_layers_total = n_layers_total
@@ -51,10 +55,10 @@ class StageRunner:
         self.caches: Dict[str, List[KVCache]] = {}
         self.stats = StageStats()
 
-    def cache_for(self, req: str) -> List[KVCache]:
+    def cache_for(self, req: str) -> List:
         c = self.caches.get(req)
         if c is None:
-            c = [KVCache() for _ in self.stage.layers]
+            c = self.backend.new_caches(len(self.stage.layers))
             self.caches[req] = c
         return c
 
@@ -67,28 +71,30 @@ class StageRunner:
         caches = self.cache_for(req)
         t0 = time.perf_counter()
         if self.spec.embed:
-            x = mx.array(header["ids"])
+            x = self.backend.array(header["ids"])
         else:
-            x = decode(header, payload)
-        want_tok = bool(header.get("logits", True))
-        y = self.stage(x, caches, apply_head=want_tok, last_only=True)
-        if self.spec.head and not want_tok:
-            mx.eval(y)
+            x = self.backend.from_wire(decode(header, payload))
+        want_tok = bool(header.get("logits", True)) and not self.body_only
+        if self.body_only:
+            y = self.stage.body(x, caches)
+        else:
+            y = self.stage(x, caches, apply_head=want_tok, last_only=True)
+        if self.spec.head and not want_tok and not self.body_only:
+            self.backend.eval(y)
             self.stats.compute_s += time.perf_counter() - t0
             self.stats.frames += 1
             return None, None          # intermediate prefill chunk: nothing to return
-        if self.spec.head:
-            tok = self.sampler(y[:, -1, :], req)
-            mx.eval(tok)
+        if self.spec.head and not self.body_only:
+            tok = self.sampler(y[:, -1, :], self.backend)
             self.stats.compute_s += time.perf_counter() - t0
             self.stats.frames += 1
             self.stats.tokens += 1
-            return ({"t": "tok", "req": req, "tok": int(tok.item()),
+            return ({"t": "tok", "req": req, "tok": tok,
                      "step": header.get("step", 0), "last": header.get("last", True)}, b"")
-        mx.eval(y)
+        self.backend.eval(y)
         self.stats.compute_s += time.perf_counter() - t0
         self.stats.frames += 1
-        h, p = encode(y, self.codec)
+        h, p = encode(self.backend.to_wire(y), self.codec)
         h.update({"t": "fwd", "req": req, "step": header.get("step", 0),
                   "last": header.get("last", True),
                   "logits": header.get("logits", True)})
@@ -142,39 +148,38 @@ class StageRunner:
 
 
 class Sampler:
-    """Greedy or temperature/top-p sampling, run on the head stage."""
+    """Greedy or temperature/top-p sampling, delegated to the backend."""
 
     def __init__(self, temperature: float = 0.0, top_p: float = 1.0, seed: int = 0):
         self.temperature = temperature
         self.top_p = top_p
-        self.key = mx.random.key(seed)
+        self.rng = np.random.default_rng(seed)
 
-    def __call__(self, logits: mx.array, req: str = "") -> mx.array:
-        if self.temperature <= 0:
-            return mx.argmax(logits, axis=-1)
-        logits = logits.astype(mx.float32) / self.temperature
-        if self.top_p < 1.0:
-            probs = mx.softmax(logits, axis=-1)
-            idx = mx.argsort(-probs, axis=-1)
-            sp = mx.take_along_axis(probs, idx, axis=-1)
-            cum = mx.cumsum(sp, axis=-1)
-            keep = cum - sp < self.top_p
-            sp = mx.where(keep, sp, 0.0)
-            self.key, sub = mx.random.split(self.key)
-            pick = mx.random.categorical(mx.log(sp + 1e-20), key=sub)
-            return mx.take_along_axis(idx, pick[..., None], axis=-1).squeeze(-1)
-        self.key, sub = mx.random.split(self.key)
-        return mx.random.categorical(logits, key=sub)
+    def __call__(self, logits, backend) -> int:
+        return backend.sample(logits, self.temperature, self.top_p, self.rng)
 
 
 def build_stage(model_dir: str, spec: ShardSpec, index: Optional[WeightIndex] = None,
-                budget_bytes: int = 0):
+                budget_bytes: int = 0, backend=None):
     """Load a shard, refusing to exceed this node's declared memory budget."""
+    backend = backend or backends.get("auto")
     index = index or WeightIndex(model_dir)
-    need = index.shard_bytes(spec)
+    need = resident_bytes(index, spec, backend.weight_expansion)
     if budget_bytes and need > budget_bytes:
         raise MemoryError(
-            f"shard needs {need / 2**30:.2f} GiB but this node's budget is "
-            f"{budget_bytes / 2**30:.2f} GiB")
-    stage, nbytes = load_stage(model_dir, spec, index)
+            f"shard needs {need / 2**30:.2f} GiB in memory on the {backend.name} "
+            f"backend but this node's budget is {budget_bytes / 2**30:.2f} GiB")
+    stage, nbytes = backend.load_stage(model_dir, spec, index)
     return stage, nbytes, index
+
+
+def resident_bytes(index: WeightIndex, spec: ShardSpec, expansion: float = 1.0) -> int:
+    """How much memory a shard actually occupies once loaded.
+
+    The NumPy backend dequantises decoder layers to float32, so they cost eight
+    times their on-disk size; embedding and output projection stay quantised.
+    """
+    lb = index.layer_bytes()
+    layer = sum(lb[spec.start:spec.end])
+    other = index.shard_bytes(spec) - layer
+    return int(layer * expansion + other)

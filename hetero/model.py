@@ -146,6 +146,22 @@ class Stage(nn.Module):
         return mx.dequantize(rows, self.embed_s[ids], self.embed_b[ids],
                              group_size=self.quant["group_size"], bits=self.quant["bits"])
 
+    def body(self, x, caches=None, mask=None):
+        """Embedding (if owned) plus this stage's layers. No output head."""
+        if self.spec.embed:
+            x = self.embed(x)
+        if mask is None and x.shape[1] > 1:
+            mask = "causal"
+        for i, layer in enumerate(self.layers):
+            x = layer(x, None if caches is None else caches[i], mask)
+        return x
+
+    def head_forward(self, x, last_only: bool = True):
+        """Final norm and vocabulary projection, applied wherever the head lives."""
+        if last_only:
+            x = x[:, -1:, :]
+        return self.lm_head(self.norm(x))
+
     def __call__(self, x: mx.array, caches: Optional[List] = None, mask=None,
                  apply_head: bool = True, last_only: bool = False) -> mx.array:
         """x: token ids if this stage embeds, else hidden states [B, L, D].

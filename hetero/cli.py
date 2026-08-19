@@ -27,6 +27,8 @@ def add_pool_args(ap):
     ap.add_argument("--codec", choices=["fp16", "int8"], default="fp16")
     ap.add_argument("--objective", choices=["latency", "throughput"], default="latency")
     ap.add_argument("--max-ctx", type=int, default=4096)
+    ap.add_argument("--backend", default="auto", choices=["auto", "mlx", "numpy", "cpu"],
+                    help="backend for this node (stage 0)")
     ap.add_argument("--shape-link", action="store_true",
                     help="apply the emulated link profile to real sends")
     ap.add_argument("--bandwidth-mbps", type=float, default=None)
@@ -42,7 +44,8 @@ def build_coordinator(a):
     return Coordinator(a.model, nodes, link, host=a.host, port=a.port, codec=a.codec,
                        objective=a.objective, max_ctx=a.max_ctx,
                        shape_link=a.shape_link, self_budget_gib=a.mem_gib,
-                       temperature=getattr(a, "temperature", 0.0))
+                       temperature=getattr(a, "temperature", 0.0),
+                       backend=getattr(a, "backend", "auto"))
 
 
 def cmd_profile(a) -> int:
@@ -61,6 +64,7 @@ def cmd_worker(a) -> int:
         argv += ["--name", a.name]
     if a.mem_gib:
         argv += ["--mem-gib", str(a.mem_gib)]
+    argv += ["--backend", a.backend]
     return main(argv) or 0
 
 
@@ -129,6 +133,7 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--name", default=None)
     p.add_argument("--mem-gib", type=float, default=0.0)
+    p.add_argument("--backend", default="auto", choices=["auto", "mlx", "numpy", "cpu"])
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("run", help="plan, wire the ring, and generate")

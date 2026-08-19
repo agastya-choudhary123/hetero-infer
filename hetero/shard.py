@@ -133,9 +133,12 @@ class WeightIndex:
     def shard_bytes(self, spec: ShardSpec) -> int:
         return sum(nb for n, (_, _, _, nb) in self.entries.items() if self.owns(n, spec))
 
-    def load_shard(self, spec: ShardSpec):
-        """Read only this stage's tensors off disk. Returns {name: mx.array}."""
-        import mlx.core as mx
+    def load_shard(self, spec: ShardSpec, framework: str = "mlx"):
+        """Read only this stage's tensors off disk.
+
+        Returns {name: array} in the requested framework — mlx arrays on Apple
+        silicon, numpy arrays on machines without it.
+        """
         from safetensors import safe_open
 
         wanted: Dict[str, List[str]] = {}
@@ -147,6 +150,10 @@ class WeightIndex:
         for path, names in wanted.items():
             with safe_open(path, framework="numpy") as f:
                 for name in names:
-                    out[name] = mx.array(f.get_tensor(name))
+                    out[name] = f.get_tensor(name)
+        if framework == "numpy":
+            return out
+        import mlx.core as mx
+        out = {k: mx.array(v) for k, v in out.items()}
         mx.eval(list(out.values()))
         return out

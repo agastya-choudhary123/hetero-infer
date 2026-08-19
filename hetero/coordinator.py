@@ -6,12 +6,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-import mlx.core as mx
-
+from . import backends
 from .engine import Sampler, StageRunner, build_stage
 from .planner import LinkSpec, NodeProfile, Plan, plan_pipeline
 from .shard import ShardSpec, WeightIndex, snapshot_dir
-from .transport import Channel, LinkProfile, connect, listen
+from .transport import Channel, LinkProfile, connect, decode, listen
 from .worker import accept_roles
 
 
@@ -35,7 +34,9 @@ class Coordinator:
                  host: str = "0.0.0.0", port: int = 29500, codec: str = "fp16",
                  objective: str = "throughput", max_ctx: int = 4096,
                  shape_link: bool = False, temperature: float = 0.0,
-                 top_p: float = 1.0, seed: int = 0, self_budget_gib: float = 0.0):
+                 top_p: float = 1.0, seed: int = 0, self_budget_gib: float = 0.0,
+                 backend: str = "auto"):
+        self.backend = backends.get(backend)
         self.model = model
         self.model_dir = snapshot_dir(model)
         self.index = WeightIndex(self.model_dir)
@@ -85,7 +86,8 @@ class Coordinator:
         # node look several times slower than it is, and the planner then cuts
         # in the wrong place.
         own = measure_node(self.model_dir, name=self.nodes[0].name,
-                           mem_bytes=self.self_budget or self.nodes[0].mem_bytes)
+                           mem_bytes=self.self_budget or self.nodes[0].mem_bytes,
+                           backend=self.backend)
         own.host, own.port = self.nodes[0].host, self.nodes[0].port
         measured = [own]
         for i, ch in enumerate(self.ctrl, start=1):
@@ -101,7 +103,7 @@ class Coordinator:
             print(f"  [{p.name}] {p.decode_s_per_layer * 1e6:.0f} us/layer, "
                   f"budget {p.mem_bytes / 2**30:.2f} GiB", flush=True)
         self.nodes = measured
-        mx.clear_cache()
+        self.backend.clear_cache()
         self.make_plan()
 
     def start(self, probe_first: bool = True) -> None:
@@ -138,17 +140,20 @@ class Coordinator:
 
         # stage 0 lives in this process
         t0 = time.perf_counter()
-        mx.reset_peak_memory()
+        self.backend.reset_peak()
         stage, nbytes, _ = build_stage(self.model_dir, plan.specs[0], self.index,
-                                       budget_bytes=self.self_budget)
-        self.own_bytes, self.own_peak = nbytes, mx.get_peak_memory()
+                                       budget_bytes=self.self_budget,
+                                       backend=self.backend)
+        self.own_bytes, self.own_peak = nbytes, self.backend.peak_bytes()
         print(f"  [{self.nodes[0].name}] layers {plan.specs[0].start}-{plan.specs[0].end - 1} "
               f"{nbytes / 2**30:.2f} GiB loaded in {time.perf_counter() - t0:.1f}s "
               f"(peak {self.own_peak / 2**30:.2f} GiB)", flush=True)
         self.runner = StageRunner(stage, plan.specs[0], self.index.config["num_hidden_layers"],
                                   self.codec,
                                   Sampler(**self.sampling) if plan.specs[0].head else None,
-                                  name=self.nodes[0].name)
+                                  name=self.nodes[0].name, backend=self.backend,
+                                  body_only=(plan.head_node == 0))
+        self.head_local = plan.head_node == 0
 
         nxt = self.nodes[1]
         self.data_out = Channel(connect(nxt.host, nxt.port, retries=1200), shaping)
@@ -215,6 +220,26 @@ class Coordinator:
         self.data_out.send({"t": "reset"})
         self.data_out_reset_bytes = self.data_out.stats()["bytes_sent"]
 
+    def recv_token(self, timeout: float = 600):
+        """Next completed step as (req, token).
+
+        When stage 0 owns the head, what comes back around the ring is a hidden
+        state rather than a token, and the projection and sampling happen here.
+        """
+        while True:
+            h, p = self.data_in.recv(timeout=timeout)
+            if h.get("t") == "tok":
+                return h["req"], h["tok"]
+            if h.get("t") == "fwd":
+                if not self.head_local:
+                    raise RuntimeError("hidden state returned but no head on stage 0")
+                if not h.get("logits", True):
+                    continue          # intermediate prefill chunk, nothing to sample
+                hid = self.backend.from_wire(decode(h, p))
+                logits = self.runner.stage.head_forward(hid, last_only=True)
+                return h["req"], self.runner.sampler(logits[:, -1, :], self.backend)
+            raise RuntimeError(f"unexpected frame {h}")
+
     def free(self, req: str) -> None:
         self.runner.free(req)
         self.data_out.send({"t": "free", "req": req})
@@ -227,17 +252,17 @@ class Coordinator:
         res = GenResult(prompt_tokens=len(ids))
         t_start = time.perf_counter()
         self._send_prefill(req, ids, chunk)
-        h, _ = self.data_in.recv(timeout=600)
+        _, tok0 = self.recv_token()
         res.ttft_s = time.perf_counter() - t_start
-        res.tokens.append(h["tok"])
+        res.tokens.append(tok0)
         t_dec = time.perf_counter()
         step = 1
         while len(res.tokens) < max_tokens:
             if stop_on_eos and res.tokens[-1] in eos:
                 break
             self._send_decode(req, res.tokens[-1], step)
-            h, _ = self.data_in.recv(timeout=600)
-            res.tokens.append(h["tok"])
+            _, nxt = self.recv_token()
+            res.tokens.append(nxt)
             step += 1
         res.decode_s = time.perf_counter() - t_dec
         res.total_s = time.perf_counter() - t_start
@@ -260,18 +285,17 @@ class Coordinator:
         live = len(reqs)
         first = None
         while live:
-            h, _ = self.data_in.recv(timeout=900)
-            r = h["req"]
+            r, tok = self.recv_token(timeout=900)
             st = reqs[r]
             if first is None:
                 first = time.perf_counter() - t0
-            st["out"].append(h["tok"])
-            if len(st["out"]) >= max_tokens or h["tok"] in eos:
+            st["out"].append(tok)
+            if len(st["out"]) >= max_tokens or tok in eos:
                 st["done"] = True
                 live -= 1
                 self.free(r)
                 continue
-            self._send_decode(r, h["tok"], st["step"])
+            self._send_decode(r, tok, st["step"])
             st["step"] += 1
         total = time.perf_counter() - t0
         gen = sum(len(s["out"]) for s in reqs.values())

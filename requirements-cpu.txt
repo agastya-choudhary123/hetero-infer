@@ -1,0 +1,4 @@
+# For pool members without MLX (Intel Macs, Linux boxes). No mlx here.
+numpy>=1.24
+safetensors>=0.4
+huggingface_hub>=0.24

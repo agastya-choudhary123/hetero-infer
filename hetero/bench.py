@@ -26,12 +26,10 @@ def decode_bench(c: Coordinator, prompt: str, warmup: int = 8, measure: int = 48
     tok = c.load_tokenizer()
     ids = tok(prompt)["input_ids"]
     c._send_prefill(req, ids, 128)
-    h, _ = c.data_in.recv(timeout=600)
-    last = h["tok"]
+    _, last = c.recv_token()
     for i in range(warmup):
         c._send_decode(req, last, i + 1)
-        h, _ = c.data_in.recv(timeout=600)
-        last = h["tok"]
+        _, last = c.recv_token()
 
     c.reset_stats()
     lat = []
@@ -39,8 +37,7 @@ def decode_bench(c: Coordinator, prompt: str, warmup: int = 8, measure: int = 48
     for i in range(measure):
         t0 = time.perf_counter()
         c._send_decode(req, last, warmup + i + 1)
-        h, _ = c.data_in.recv(timeout=600)
-        last = h["tok"]
+        _, last = c.recv_token()
         lat.append(time.perf_counter() - t0)
     wall = time.perf_counter() - t_start
     stats = c.query_stats()
@@ -114,7 +111,7 @@ def prefill_bench(c: Coordinator, n_tokens: int = 512, chunks: Optional[List[int
             req = f"pf{chunk}_{r}"
             t0 = time.perf_counter()
             c._send_prefill(req, ids, chunk)
-            c.data_in.recv(timeout=900)
+            c.recv_token(timeout=900)
             dt = time.perf_counter() - t0
             c.free(req)
             best = dt if best is None else min(best, dt)

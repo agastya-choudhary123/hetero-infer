@@ -12,8 +12,7 @@ import socket
 import sys
 import time
 
-import mlx.core as mx
-
+from . import backends
 from .engine import Sampler, StageRunner, build_stage
 from .planner import LinkSpec
 from .shard import ShardSpec, snapshot_dir
@@ -42,19 +41,22 @@ def main(argv=None) -> int:
     ap.add_argument("--name", default=None)
     ap.add_argument("--mem-gib", type=float, default=0.0,
                     help="hard memory budget for this node; refuses shards that exceed it")
+    ap.add_argument("--backend", default="auto", choices=["auto", "mlx", "numpy", "cpu"],
+                    help="auto picks MLX on Apple silicon, NumPy elsewhere")
     args = ap.parse_args(argv)
+    backend = backends.get(args.backend)
     name = args.name or f"worker:{args.port}"
     budget = int(args.mem_gib * 2**30)
 
     srv = listen(args.host, args.port)
-    print(f"[{name}] listening on {args.host}:{args.port}"
+    print(f"[{name}] listening on {args.host}:{args.port} backend={backend.name}"
           + (f" budget {args.mem_gib:.2f} GiB" if budget else ""), flush=True)
 
     while True:
         chans = accept_roles(srv, {"control"})
         ctrl = chans["control"]
         try:
-            serve_session(ctrl, srv, name, budget)
+            serve_session(ctrl, srv, name, budget, backend)
         except (ConnectionError, EOFError) as e:
             print(f"[{name}] session ended: {e}", flush=True)
         finally:
@@ -62,14 +64,15 @@ def main(argv=None) -> int:
                 ctrl.close()
             except Exception:
                 pass
-            mx.clear_cache()
+            backend.clear_cache()
 
 
-def serve_session(ctrl: Channel, srv: socket.socket, name: str, budget: int) -> None:
+def serve_session(ctrl: Channel, srv: socket.socket, name: str, budget: int,
+                  backend=None) -> None:
+    backend = backend or backends.get("auto")
     # Phase 1: the coordinator probes this node. We measure ourselves rather
     # than let it assume the pool is symmetric, and we answer link pings so it
     # can time the wire between us.
-    # Setup phase: answer link probes and self-measure until a plan arrives.
     while True:
         header, _ = ctrl.recv(timeout=900)
         t = header.get("t")
@@ -77,9 +80,11 @@ def serve_session(ctrl: Channel, srv: socket.socket, name: str, budget: int) -> 
             ctrl.send({"t": "ack"})
         elif t == "probe":
             from .profile import measure_node
-            prof = measure_node(snapshot_dir(header["model"]), name=name, mem_bytes=budget)
-            mx.clear_cache()
-            print(f"[{name}] profiled: {prof.decode_s_per_layer * 1e6:.0f} us/layer, "
+            prof = measure_node(snapshot_dir(header["model"]), name=name,
+                                mem_bytes=budget, backend=backend)
+            backend.clear_cache()
+            print(f"[{name}] profiled on {backend.name}: "
+                  f"{prof.decode_s_per_layer * 1e6:.0f} us/layer, "
                   f"budget {prof.mem_bytes / 2**30:.2f} GiB", flush=True)
             ctrl.send({"t": "profile", **prof.to_json()})
         elif t == "plan":
@@ -92,17 +97,18 @@ def serve_session(ctrl: Channel, srv: socket.socket, name: str, budget: int) -> 
     codec = header.get("codec", "fp16")
 
     t0 = time.perf_counter()
-    mx.reset_peak_memory()
-    stage, nbytes, index = build_stage(model_dir, spec, budget_bytes=budget)
+    backend.reset_peak()
+    stage, nbytes, index = build_stage(model_dir, spec, budget_bytes=budget,
+                                       backend=backend)
     load_s = time.perf_counter() - t0
-    peak = mx.get_peak_memory()
+    peak = backend.peak_bytes()
     print(f"[{name}] loaded layers {spec.start}-{spec.end - 1} "
           f"({nbytes / 2**30:.2f} GiB) in {load_s:.1f}s, peak {peak / 2**30:.2f} GiB", flush=True)
 
     runner = StageRunner(stage, spec, index.config["num_hidden_layers"], codec,
                          Sampler(header.get("temperature", 0.0), header.get("top_p", 1.0),
                                  header.get("seed", 0)) if spec.head else None,
-                         name=name)
+                         name=name, backend=backend)
     ctrl.send({"t": "ready", "name": name, "bytes": nbytes, "peak": peak,
                "load_s": load_s, "layers": [spec.start, spec.end]})
 
@@ -120,7 +126,7 @@ def serve_session(ctrl: Channel, srv: socket.socket, name: str, budget: int) -> 
         ctrl.send({"t": "stats", "name": name,
                    "compute_s": runner.stats.compute_s, "frames": runner.stats.frames,
                    "wait_s": runner.stats.wait_s, "bytes_out": runner.stats.bytes_out,
-                   "link": data_out.stats(), "peak": mx.get_peak_memory()})
+                   "link": data_out.stats(), "peak": backend.peak_bytes()})
         time.sleep(0.2)
         data_in.close()
         data_out.close()
