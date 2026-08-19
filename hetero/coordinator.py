@@ -244,10 +244,22 @@ class Coordinator:
         self.runner.free(req)
         self.data_out.send({"t": "free", "req": req})
 
-    def generate(self, prompt: str, max_tokens: int = 64, chunk: int = 128,
-                 stop_on_eos: bool = True, req: str = "r0") -> GenResult:
+    def encode_prompt(self, prompt: str, chat: bool = False) -> List[int]:
+        """Instruct checkpoints answer properly only through their chat template."""
         tok = self.load_tokenizer()
+        if chat and getattr(tok, "chat_template", None):
+            # Render to text and tokenise separately — what apply_chat_template
+            # returns directly varies across transformers versions.
+            prompt = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                             add_generation_prompt=True, tokenize=False)
         ids = tok(prompt)["input_ids"]
+        return list(ids.ids) if hasattr(ids, "ids") else list(ids)
+
+    def generate(self, prompt: str, max_tokens: int = 64, chunk: int = 128,
+                 stop_on_eos: bool = True, req: str = "r0",
+                 chat: bool = False) -> GenResult:
+        tok = self.load_tokenizer()
+        ids = self.encode_prompt(prompt, chat)
         eos = _eos_ids(tok)
         res = GenResult(prompt_tokens=len(ids))
         t_start = time.perf_counter()

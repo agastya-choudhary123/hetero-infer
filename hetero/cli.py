@@ -78,16 +78,19 @@ def cmd_run(a) -> int:
               file=sys.stderr)
         return 2
     print(c.plan.describe())
-    r = c.generate(a.prompt, max_tokens=a.max_tokens, chunk=a.chunk)
+    r = c.generate(a.prompt, max_tokens=a.max_tokens, chunk=a.chunk,
+                   chat=getattr(a, "chat", False))
     print("\n--- output ---")
     print(r.text)
     print("---")
     print(f"prompt {r.prompt_tokens} tok | TTFT {r.ttft_s * 1e3:.0f} ms | "
-          f"{len(r.tokens)} tokens | {r.tok_per_s:.2f} tok/s")
+          f"{len(r.tokens)} generated | {r.tok_per_s:.2f} tok/s | "
+          f"{r.total_s:.1f} s wall")
     stats = c.stop()
     for s in stats:
-        print(f"  [{s['name']}] compute {s['compute_s'] * 1e3:.0f} ms over {s['frames']} frames, "
-              f"sent {s['link']['bytes_sent'] / 1e6:.2f} MB")
+        print(f"  [{s['name']}] compute {s['compute_s'] * 1e3:8.0f} ms over {s['frames']:3d} frames"
+              f" | {s['link']['bytes_sent'] / 1e6:5.2f} MB on the wire"
+              f" | peak {s['peak'] / 2**30:.2f} GiB")
     return 0
 
 
@@ -143,6 +146,8 @@ def main(argv=None) -> int:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--chunk", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--chat", action="store_true",
+                   help="wrap the prompt in the model's chat template")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("plan", help="what-if a pool without launching it")

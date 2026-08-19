@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ARCH=$(uname -m)
-OUT=libq4gemv.so
-FLAGS="-O3 -shared -fPIC -pthread"
+OUT=${OUT:-libq4gemv.so}
+FLAGS="-O3 -shared -fPIC -pthread -DROWS=${ROWS:-1}"
 if [[ "$ARCH" == "arm64" ]]; then
   FLAGS="$FLAGS -mcpu=native"
 else

@@ -24,7 +24,8 @@ import numpy as np
 from .shard import ShardSpec, WeightIndex
 
 HEAD_BLOCK = 8192          # rows dequantised at a time on the GEMM path
-GEMV_ROWS_MAX = 32         # up to this many rows, loop the fused GEMV instead
+GEMV_ROWS_MAX = 48         # up to this many rows, loop the fused GEMV instead
+                           # (measured crossover against the dequant+BLAS path)
 
 
 def _load_kernel():
@@ -40,8 +41,23 @@ def _load_kernel():
     return lib
 
 
+def _tuning():
+    """Thread count chosen by kernel/autotune.py on this machine."""
+    import json
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "kernel", "tuning.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 KERNEL = _load_kernel()
-NTHREADS = int(os.environ.get("HETERO_THREADS", "0")) or (os.cpu_count() or 2)
+TUNING = _tuning()
+NTHREADS = (int(os.environ.get("HETERO_THREADS", "0"))
+            or TUNING.get("threads")
+            or (os.cpu_count() or 2))
 
 
 def dequantize(w_u32: np.ndarray, scales: np.ndarray, biases: np.ndarray,
@@ -134,17 +150,37 @@ def silu(x: np.ndarray) -> np.ndarray:
 
 
 class RoPE:
+    """Rotary embedding with a cached cos/sin table.
+
+    Decode calls this twice per layer with a single position, so recomputing
+    the transcendentals every time is pure waste; the table grows as context
+    does and is shared by every layer.
+    """
+
     def __init__(self, dims: int, base: float):
         self.half = dims // 2
         self.inv = base ** (-np.arange(0, self.half, dtype=np.float32) * 2.0 / dims)
+        self._n = 0
+        self._cos = self._sin = None
+
+    def _table(self, upto: int):
+        if self._n < upto:
+            n = max(upto, 256, self._n * 2)
+            ang = np.arange(n, dtype=np.float32)[:, None] * self.inv[None, :]
+            self._cos, self._sin = np.cos(ang), np.sin(ang)
+            self._n = n
+        return self._cos, self._sin
 
     def __call__(self, x: np.ndarray, offset: int = 0) -> np.ndarray:
         L = x.shape[2]
-        pos = np.arange(offset, offset + L, dtype=np.float32)[:, None]
-        ang = pos * self.inv[None, :]
-        cos, sin = np.cos(ang), np.sin(ang)
+        cos, sin = self._table(offset + L)
+        cos = cos[offset:offset + L]
+        sin = sin[offset:offset + L]
         x1, x2 = x[..., :self.half], x[..., self.half:]
-        return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+        out = np.empty_like(x)
+        np.subtract(x1 * cos, x2 * sin, out=out[..., :self.half])
+        np.add(x1 * sin, x2 * cos, out=out[..., self.half:])
+        return out
 
 
 class KVCache:
@@ -174,18 +210,25 @@ class KVCache:
 
 
 def sdpa(q, k, v, scale, causal):
+    """Grouped-query attention without expanding K and V.
+
+    np.repeat on the key and value heads allocates a full copy of the cache on
+    every call, which at decode dwarfs the arithmetic. Reshaping the query into
+    (kv-head, group) instead lets the same K broadcast across its group.
+    """
     B, H, L, D = q.shape
     KH, S = k.shape[1], k.shape[2]
-    if H != KH:
-        k = np.repeat(k, H // KH, axis=1)
-        v = np.repeat(v, H // KH, axis=1)
-    s = (q @ k.transpose(0, 1, 3, 2)) * scale
+    G = H // KH
+    q5 = q.reshape(B, KH, G, L, D)
+    s = np.einsum("bkgld,bksd->bkgls", q5, k, optimize=True) * scale
     if causal and L > 1:
         i = np.arange(L)[:, None] + (S - L)
         s = np.where(np.arange(S)[None, :] <= i, s, -np.inf)
     s -= s.max(-1, keepdims=True)
     e = np.exp(s)
-    return (e / e.sum(-1, keepdims=True)) @ v
+    e /= e.sum(-1, keepdims=True)
+    o = np.einsum("bkgls,bksd->bkgld", e, v, optimize=True)
+    return o.reshape(B, H, L, D)
 
 
 class Attention:

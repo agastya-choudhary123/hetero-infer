@@ -97,6 +97,7 @@ fi
 say "syncing project to $HOST:$REMOTE_DIR"
 $RSYNC -az --delete \
   --exclude .git --exclude __pycache__ --exclude 'bench/results' --exclude '*.so' \
+  --exclude 'kernel/tuning.json' \
   ./ "$HOST:$REMOTE_DIR/"
 
 say "installing dependencies over there (quiet unless something is missing)"
@@ -105,8 +106,18 @@ $SSH "$HOST" "cd $REMOTE_DIR && $RPY -m pip install -q --user -r $REQS"
 # The fused int4 kernel is what makes a CPU node worth having: weights stay
 # packed, so it holds 8x more layers and decodes several times faster.
 if [[ "$BACKEND" != "auto" ]]; then
-  say "building the int4 kernel on $HOST"
-  $SSH "$HOST" "cd $REMOTE_DIR && bash kernel/build.sh"
+  # Autotune once per machine: the best row-blocking factor and thread count
+  # differ by CPU, and the answer is cached in kernel/tuning.json.
+  if $SSH -n "$HOST" "test -f $REMOTE_DIR/kernel/tuning.json"; then
+    say "int4 kernel already tuned on $HOST ($($SSH -n "$HOST" "cd $REMOTE_DIR && \
+      $RPY -c \"import json;t=json.load(open('kernel/tuning.json'));print(f\\\"ROWS={t['rows']}, {t['threads']} threads\\\")\""))"
+    $SSH -n "$HOST" "cd $REMOTE_DIR && bash kernel/build.sh >/dev/null && \
+      ROWS=\$($RPY -c \"import json;print(json.load(open('kernel/tuning.json'))['rows'])\") \
+      bash kernel/build.sh >/dev/null"
+  else
+    say "autotuning the int4 kernel on $HOST (once, takes a minute)"
+    $SSH -n "$HOST" "cd $REMOTE_DIR && $RPY kernel/autotune.py"
+  fi
 fi
 
 # --- 4. make sure the weights are already over there ------------------------
@@ -159,6 +170,6 @@ if [[ "$MODE" == "bench" ]]; then
 else
   python3 -u -m hetero.cli run --model "$MODEL" --peer "$PEER" \
     --name "$(hostname -s)" --mem-gib "$BUDGET" --objective latency \
-    --max-tokens "${MAX_TOKENS:-64}" \
+    --max-tokens "${MAX_TOKENS:-64}" ${CHAT:+--chat} \
     --prompt "${PROMPT:-Explain, in two sentences, what pipeline parallelism is.}"
 fi
