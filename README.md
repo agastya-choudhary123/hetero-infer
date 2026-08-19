@@ -190,13 +190,26 @@ Two nodes on this machine, 2.5 GiB budget each:
 ./scripts/run_local_2node.sh
 ```
 
-Two real machines. On the box that will hold the tail of the model:
+Two real machines, one command. Turn on Remote Login on the other box
+(System Settings -> General -> Sharing), then:
+
+```bash
+./scripts/pool.sh you@desktop.local          # generate
+./scripts/pool.sh you@desktop.local bench    # full measurement suite
+```
+
+It mirrors the project over, installs what it needs, fetches the weights,
+starts the far side, runs, and shuts it down again. Budgets are picked at 65%
+of the model size so that neither machine could hold it alone — if text comes
+out, the pool produced it.
+
+To drive the two sides by hand instead, start the far one:
 
 ```bash
 python3 -m hetero.cli worker --port 29501 --name laptop --mem-gib 6
 ```
 
-then on the head machine:
+and point this one at it:
 
 ```bash
 PEER=192.168.1.42:29501:laptop:6 ./scripts/run_lan.sh
@@ -244,9 +257,10 @@ exactly.
 
 **The two-machine case is not measured end to end.** Every number here comes
 from two (or three) processes on one M4. The protocol, the planner, the
-self-profiling handshake and the LAN launcher are all written for real boxes,
-but I only had one machine, so treat the LAN path as untested against real
-hardware.
+self-profiling handshake and the launchers are all written for real boxes, and
+`pool.sh` was exercised end to end against a stand-in for the remote side, but
+the real `ssh`/`rsync` hop over a LAN has never run. Treat the two-machine path
+as unverified against real hardware until you run it.
 
 **Sharing one GPU understates concurrency.** Both stages contend for the same
 GPU here, so they cannot truly compute at once. That is why loopback throughput
