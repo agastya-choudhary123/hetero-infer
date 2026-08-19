@@ -1,0 +1,567 @@
+{
+  "single_node": {
+    "tokens": 64,
+    "wall_s": 2.632771291071549,
+    "tok_per_s": 24.308985826851572,
+    "ms_per_token": 41.137051422992954,
+    "weight_gib": 3.9900312423706055,
+    "peak_gib": 3.9930524826049805,
+    "text": " Pipeline parallelism is a technique used in distributed deep learning to split the computation of a transformer model across multiple machines, allowing",
+    "token_ids": [
+      40907,
+      15279,
+      2142,
+      374,
+      264,
+      14762,
+      1483,
+      304,
+      4237,
+      5538,
+      6832,
+      311,
+      6718,
+      279,
+      34447,
+      315,
+      264,
+      42578,
+      1614,
+      3941,
+      5248,
+      12645,
+      11,
+      10693
+    ]
+  },
+  "meta": {
+    "model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "model_bytes": 4284263424,
+    "layers": 28,
+    "hidden": 3584,
+    "nodes": [
+      {
+        "name": "node-a",
+        "host": "0.0.0.0",
+        "port": 29500,
+        "mem_bytes": 2684354560,
+        "decode_s_per_layer": 0.0013541822918341495,
+        "prefill_s_per_layer_token": 0.00013591297736563016,
+        "embed_s": 0.0002192968774276475,
+        "head_s": 0.0030731510390372327
+      },
+      {
+        "name": "node-b",
+        "host": "127.0.0.1",
+        "port": 29501,
+        "mem_bytes": 2684354560,
+        "decode_s_per_layer": 0.0013574657071634042,
+        "prefill_s_per_layer_token": 0.00013599045833719478,
+        "embed_s": 0.00021203125167327622,
+        "head_s": 0.003091522584630487
+      }
+    ],
+    "budget_gib_per_node": 2.5,
+    "objective": "latency",
+    "measured_link": {
+      "bandwidth_mbps": 24960.997639683967,
+      "rtt_ms": 0.047749956138432026
+    },
+    "host": "macOS-15.3.1-arm64-arm-64bit",
+    "note": "both stages run as separate processes on one machine; they share a GPU, so stage compute cannot truly overlap"
+  },
+  "plan": {
+    "cuts": [
+      0,
+      17,
+      28
+    ],
+    "nodes": [
+      {
+        "name": "node-a",
+        "host": "0.0.0.0",
+        "port": 29500,
+        "mem_bytes": 2684354560,
+        "decode_s_per_layer": 0.0013541822918341495,
+        "prefill_s_per_layer_token": 0.00013591297736563016,
+        "embed_s": 0.0002192968774276475,
+        "head_s": 0.0030731510390372327
+      },
+      {
+        "name": "node-b",
+        "host": "127.0.0.1",
+        "port": 29501,
+        "mem_bytes": 2684354560,
+        "decode_s_per_layer": 0.0013574657071634042,
+        "prefill_s_per_layer_token": 0.00013599045833719478,
+        "embed_s": 0.00021203125167327622,
+        "head_s": 0.003091522584630487
+      }
+    ],
+    "specs": [
+      {
+        "start": 0,
+        "end": 17,
+        "embed": true,
+        "head": false
+      },
+      {
+        "start": 17,
+        "end": 28,
+        "embed": false,
+        "head": true
+      }
+    ],
+    "objective": "latency",
+    "predicted_decode_s": 0.04131415003825018,
+    "stage_compute_s": [
+      0.02324039583860819,
+      0.01802364536342793
+    ],
+    "stage_comm_s": [
+      2.620309014385566e-05,
+      0.0
+    ],
+    "stage_bytes": [
+      2535463936,
+      1748799488
+    ],
+    "stage_mem_bytes": [
+      2678070272,
+      1841074176
+    ]
+  },
+  "memory": {
+    "model_gib": 3.9900312423706055,
+    "per_node_budget_gib": 2.5,
+    "stage_weight_gib": [
+      2.361334800720215,
+      1.6286964416503906
+    ],
+    "stage_peak_gib": [
+      2.363165855407715,
+      1.6298866271972656
+    ]
+  },
+  "agrees_with_single_node": true,
+  "link_sweep": [
+    {
+      "tokens": 64,
+      "wall_s": 2.6583266250090674,
+      "tok_per_s": 24.075295863909012,
+      "ms_per_token": 41.53635351576668,
+      "p50_ms": 41.50675004348159,
+      "p99_ms": 42.09812497720122,
+      "compute_ms_per_token": 41.323387988086324,
+      "offstage_ms_per_token": 0.21296552768035326,
+      "network_loss_pct": 0.5127208087718009,
+      "stage_compute_ms": {
+        "node-a": 23.21783850857173,
+        "node-b": 18.105549479514593
+      },
+      "bytes_per_token": 7593.453125,
+      "link": "loopback (unshaped)",
+      "bandwidth_mbps": null,
+      "rtt_ms": null,
+      "reference_ms_per_token": 41.62473567157576,
+      "reference_compute_ms_per_token": 41.404003985007876,
+      "clock_drop_ms_per_token": -0.08061599692155141,
+      "loss_vs_free_network_pct": -0.21278265501938343
+    },
+    {
+      "tokens": 64,
+      "wall_s": 2.6737120839534327,
+      "tok_per_s": 23.936758330899877,
+      "ms_per_token": 41.77675131177239,
+      "p50_ms": 41.670083068311214,
+      "p99_ms": 43.65412495099008,
+      "compute_ms_per_token": 41.45083336698008,
+      "offstage_ms_per_token": 0.32591794479230884,
+      "network_loss_pct": 0.7801419080197065,
+      "stage_compute_ms": {
+        "node-a": 23.300953163925442,
+        "node-b": 18.149880203054636
+      },
+      "bytes_per_token": 7777.46875,
+      "link": "10 GbE",
+      "bandwidth_mbps": 10000,
+      "rtt_ms": 0.1,
+      "reference_ms_per_token": 41.61095117160585,
+      "reference_compute_ms_per_token": 41.40411128901178,
+      "clock_drop_ms_per_token": 0.046722077968297526,
+      "loss_vs_free_network_pct": 0.3968717886395745
+    },
+    {
+      "tokens": 64,
+      "wall_s": 2.7053828339558095,
+      "tok_per_s": 23.656541025071572,
+      "ms_per_token": 42.27160678055952,
+      "p50_ms": 41.94533301051706,
+      "p99_ms": 48.92016598023474,
+      "compute_ms_per_token": 41.67965878514224,
+      "offstage_ms_per_token": 0.5919479954172857,
+      "network_loss_pct": 1.4003442038297897,
+      "stage_compute_ms": {
+        "node-a": 23.398410756271915,
+        "node-b": 18.281248028870323
+      },
+      "bytes_per_token": 7962.03125,
+      "link": "1 GbE",
+      "bandwidth_mbps": 1000,
+      "rtt_ms": 0.3,
+      "reference_ms_per_token": 41.59960285869602,
+      "reference_compute_ms_per_token": 41.38329218403669,
+      "clock_drop_ms_per_token": 0.2963666011055466,
+      "loss_vs_free_network_pct": 1.5897288346573002
+    },
+    {
+      "tokens": 64,
+      "wall_s": 2.9003603329183534,
+      "tok_per_s": 22.066223728692,
+      "ms_per_token": 45.31813020184927,
+      "p50_ms": 45.26774992700666,
+      "p99_ms": 47.01700003352016,
+      "compute_ms_per_token": 42.60168944892939,
+      "offstage_ms_per_token": 2.7164407529198797,
+      "network_loss_pct": 5.9941589399666615,
+      "stage_compute_ms": {
+        "node-a": 23.76595898749656,
+        "node-b": 18.83573046143283
+      },
+      "bytes_per_token": 8146.5625,
+      "link": "Wi-Fi 5, typical",
+      "bandwidth_mbps": 300,
+      "rtt_ms": 2.0,
+      "reference_ms_per_token": 41.592131499783136,
+      "reference_compute_ms_per_token": 41.37731192531646,
+      "clock_drop_ms_per_token": 1.2243775236129295,
+      "loss_vs_free_network_pct": 8.221872097260729
+    },
+    {
+      "tokens": 64,
+      "wall_s": 2.8051323329564184,
+      "tok_per_s": 22.815322916530057,
+      "ms_per_token": 43.83019270244404,
+      "p50_ms": 43.823583982884884,
+      "p99_ms": 44.33537495788187,
+      "compute_ms_per_token": 41.883089226757875,
+      "offstage_ms_per_token": 1.9471034756861627,
+      "network_loss_pct": 4.442379454967783,
+      "stage_compute_ms": {
+        "node-a": 23.2310846386099,
+        "node-b": 18.652004588147975
+      },
+      "bytes_per_token": 8331.0625,
+      "link": "100 Mbit switched",
+      "bandwidth_mbps": 100,
+      "rtt_ms": 1.0,
+      "reference_ms_per_token": 43.32473242175183,
+      "reference_compute_ms_per_token": 43.051464193922584,
+      "clock_drop_ms_per_token": -1.1683749671647092,
+      "loss_vs_free_network_pct": 1.1532239525472554
+    },
+    {
+      "tokens": 64,
+      "wall_s": 3.7166565828956664,
+      "tok_per_s": 17.219777661065816,
+      "ms_per_token": 58.07275910774479,
+      "p50_ms": 58.10012493748218,
+      "p99_ms": 59.10645890980959,
+      "compute_ms_per_token": 47.65266022877768,
+      "offstage_ms_per_token": 10.42009887896711,
+      "network_loss_pct": 17.943178590213478,
+      "stage_compute_ms": {
+        "node-a": 26.494648514926666,
+        "node-b": 21.15801171385101
+      },
+      "bytes_per_token": 8515.546875,
+      "link": "weak Wi-Fi",
+      "bandwidth_mbps": 50,
+      "rtt_ms": 8.0,
+      "reference_ms_per_token": 41.71629167103674,
+      "reference_compute_ms_per_token": 41.495246783597395,
+      "clock_drop_ms_per_token": 6.157413445180282,
+      "loss_vs_free_network_pct": 28.16547325805755
+    }
+  ],
+  "codec": [
+    {
+      "tokens": 64,
+      "wall_s": 2.902447458007373,
+      "tok_per_s": 22.050356096347095,
+      "ms_per_token": 45.3507415313652,
+      "p50_ms": 43.94858400337398,
+      "p99_ms": 55.13716710265726,
+      "compute_ms_per_token": 43.355412755772704,
+      "offstage_ms_per_token": 1.9953287755924975,
+      "network_loss_pct": 4.399771003110281,
+      "stage_compute_ms": {
+        "node-a": 24.083200569293695,
+        "node-b": 19.27221218647901
+      },
+      "bytes_per_token": 8608.4375,
+      "link": "100 Mbit switched",
+      "codec": "fp16"
+    },
+    {
+      "tokens": 64,
+      "wall_s": 2.79136633395683,
+      "tok_per_s": 22.927839754117272,
+      "ms_per_token": 43.61509896807547,
+      "p50_ms": 43.664874974638224,
+      "p99_ms": 47.43854096159339,
+      "compute_ms_per_token": 41.86247456163983,
+      "offstage_ms_per_token": 1.7526244064356433,
+      "network_loss_pct": 4.018389153991133,
+      "stage_compute_ms": {
+        "node-a": 23.27419135326636,
+        "node-b": 18.58828320837347
+      },
+      "bytes_per_token": 5121.34375,
+      "link": "100 Mbit switched",
+      "codec": "int8"
+    },
+    {
+      "tokens": 64,
+      "wall_s": 3.718355083023198,
+      "tok_per_s": 17.211911872592054,
+      "ms_per_token": 58.09929817223747,
+      "p50_ms": 58.16058407071978,
+      "p99_ms": 59.38491690903902,
+      "compute_ms_per_token": 47.66936132182309,
+      "offstage_ms_per_token": 10.429936850414379,
+      "network_loss_pct": 17.951915390603265,
+      "stage_compute_ms": {
+        "node-a": 26.504596360609867,
+        "node-b": 21.164764961213223
+      },
+      "bytes_per_token": 8794.234375,
+      "link": "weak Wi-Fi",
+      "codec": "fp16"
+    },
+    {
+      "tokens": 64,
+      "wall_s": 3.7133692499483004,
+      "tok_per_s": 17.23502180691862,
+      "ms_per_token": 58.021394530442194,
+      "p50_ms": 58.07525001000613,
+      "p99_ms": 59.01383294258267,
+      "compute_ms_per_token": 47.796993423617096,
+      "offstage_ms_per_token": 10.224401106825098,
+      "network_loss_pct": 17.621777603881345,
+      "stage_compute_ms": {
+        "node-a": 26.5538755684247,
+        "node-b": 21.243117855192395
+      },
+      "bytes_per_token": 5307.09375,
+      "link": "weak Wi-Fi",
+      "codec": "int8"
+    }
+  ],
+  "throughput": [
+    {
+      "streams": 1,
+      "tokens": 24,
+      "wall_s": 1.1326943329768255,
+      "tok_per_s": 21.188417123025395,
+      "ttft_ms": 136.35974994394928,
+      "busiest_stage_util_pct": 56.04442266792016,
+      "stage_compute_s": [
+        0.634811999509111,
+        0.48926487378776073
+      ],
+      "link": "loopback (unshaped)"
+    },
+    {
+      "streams": 2,
+      "tokens": 48,
+      "wall_s": 2.115558375022374,
+      "tok_per_s": 22.689045391854222,
+      "ttft_ms": 202.1390829468146,
+      "busiest_stage_util_pct": 98.25028262016619,
+      "stage_compute_s": [
+        2.078542082454078,
+        1.8126298729330301
+      ],
+      "link": "loopback (unshaped)"
+    },
+    {
+      "streams": 4,
+      "tokens": 96,
+      "wall_s": 4.158890332910232,
+      "tok_per_s": 23.083080416987787,
+      "ttft_ms": 450.9947500191629,
+      "busiest_stage_util_pct": 99.46948383028646,
+      "stage_compute_s": [
+        4.13682674721349,
+        3.6390491687925532
+      ],
+      "link": "loopback (unshaped)"
+    },
+    {
+      "streams": 8,
+      "tokens": 192,
+      "wall_s": 8.322297666920349,
+      "tok_per_s": 23.070551869727733,
+      "ttft_ms": 951.8684999784455,
+      "busiest_stage_util_pct": 99.68867668980201,
+      "stage_compute_s": [
+        8.296388414339162,
+        7.297709793667309
+      ],
+      "link": "loopback (unshaped)"
+    },
+    {
+      "streams": 1,
+      "tokens": 24,
+      "wall_s": 1.4830594999948516,
+      "tok_per_s": 16.18276272805192,
+      "ttft_ms": 156.60087496507913,
+      "busiest_stage_util_pct": 45.802730632338594,
+      "stage_compute_s": [
+        0.6792817478999496,
+        0.5373332910239697
+      ],
+      "link": "weak Wi-Fi"
+    },
+    {
+      "streams": 2,
+      "tokens": 48,
+      "wall_s": 2.189151541911997,
+      "tok_per_s": 21.926302990462222,
+      "ttft_ms": 211.45970793440938,
+      "busiest_stage_util_pct": 92.53996557956988,
+      "stage_compute_s": [
+        2.0258400833699852,
+        1.6884642500663176
+      ],
+      "link": "weak Wi-Fi"
+    },
+    {
+      "streams": 4,
+      "tokens": 96,
+      "wall_s": 4.131521499948576,
+      "tok_per_s": 23.23599187398514,
+      "ttft_ms": 450.05474996287376,
+      "busiest_stage_util_pct": 99.21562494170371,
+      "stage_compute_s": [
+        4.099114875774831,
+        3.4728952071163803
+      ],
+      "link": "weak Wi-Fi"
+    },
+    {
+      "streams": 8,
+      "tokens": 192,
+      "wall_s": 8.281308459001593,
+      "tok_per_s": 23.18474199464221,
+      "ttft_ms": 954.5691250823438,
+      "busiest_stage_util_pct": 99.55011081746026,
+      "stage_compute_s": [
+        8.244051748071797,
+        7.008518375805579
+      ],
+      "link": "weak Wi-Fi"
+    }
+  ],
+  "prefill_codec": {
+    "fp16": {
+      "ttft_ms": 2677.1793749649078,
+      "prefill_tok_per_s": 191.2460572451225
+    },
+    "int8": {
+      "ttft_ms": 2417.106332955882,
+      "prefill_tok_per_s": 211.82353172434688
+    }
+  },
+  "prefill": [
+    {
+      "prompt_tokens": 512,
+      "by_chunk": {
+        "512": {
+          "ttft_ms": 2112.0992499636486,
+          "prefill_tok_per_s": 242.41285063133847
+        },
+        "256": {
+          "ttft_ms": 2110.5945829767734,
+          "prefill_tok_per_s": 242.58566952156082
+        },
+        "128": {
+          "ttft_ms": 2112.9513329360634,
+          "prefill_tok_per_s": 242.31509359401454
+        },
+        "64": {
+          "ttft_ms": 2122.276082984172,
+          "prefill_tok_per_s": 241.25042170765423
+        },
+        "32": {
+          "ttft_ms": 2147.1582499798387,
+          "prefill_tok_per_s": 238.454711013875
+        }
+      },
+      "link": "loopback (unshaped)"
+    },
+    {
+      "prompt_tokens": 512,
+      "by_chunk": {
+        "512": {
+          "ttft_ms": 2747.7524579735473,
+          "prefill_tok_per_s": 186.33410681309962
+        },
+        "256": {
+          "ttft_ms": 2397.849041968584,
+          "prefill_tok_per_s": 213.52470111281846
+        },
+        "128": {
+          "ttft_ms": 2258.5153330583125,
+          "prefill_tok_per_s": 226.6975975348761
+        },
+        "64": {
+          "ttft_ms": 2196.5946670388803,
+          "prefill_tok_per_s": 233.08806475898518
+        },
+        "32": {
+          "ttft_ms": 2173.4979590401053,
+          "prefill_tok_per_s": 235.56497850410568
+        }
+      },
+      "link": "weak Wi-Fi"
+    }
+  ],
+  "prediction": {
+    "predicted_ms_per_token": 41.31415003825018,
+    "measured_ms_per_token": 41.53635351576668,
+    "error_pct": -0.5349614463199054
+  },
+  "final_stats": [
+    {
+      "name": "node-a",
+      "compute_s": 69.75753254897427,
+      "frames": 384,
+      "wait_s": 0.0,
+      "bytes_out": 128858112,
+      "link": {
+        "bytes_sent": 145417914,
+        "bytes_recv": 0,
+        "frames_sent": 2310,
+        "shaped_seconds": 15.69101210106672
+      },
+      "peak": 2537430016
+    },
+    {
+      "t": "stats",
+      "name": "node-b",
+      "compute_s": 52.5085994185647,
+      "frames": 384,
+      "wait_s": 38.7892358279787,
+      "bytes_out": 0,
+      "link": {
+        "bytes_sent": 162256,
+        "bytes_recv": 0,
+        "frames_sent": 2044,
+        "shaped_seconds": 2.6594179389333226
+      },
+      "peak": 2160595000
+    }
+  ]
+}
