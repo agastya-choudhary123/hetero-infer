@@ -16,6 +16,16 @@
  *    sum_{i in group} x_i is computed once for the whole matrix:
  *      y[o] = sum_g ( scale[o][g] * sum_i q_i x_i  +  bias[o][g] * xsum[g] )
  *
+ *  - On AVX2 the dot product runs in 16-bit integers via vpmaddwd rather than
+ *    in floats. Extracting nibbles with a per-word variable shift was measured
+ *    (by bisecting the loop stage by stage) to be the single largest cost:
+ *    load-only sustains 10-11 GB/s on the 2013 machine, and adding just the
+ *    extract dropped it to 3.7. Splitting a whole 32-byte block with one shift
+ *    and keeping the values 8- then 16-bit avoids both that and the
+ *    integer-to-float conversion, and reaches 9.4 GB/s. x is quantised to
+ *    int16 once per call, which costs n_in operations against n_out*n_in/2
+ *    bytes of weights.
+ *
  *  - The reduction stays per group. Folding the scale into the accumulator to
  *    defer it to once per row was measured and was 2x slower: it costs an extra
  *    multiply in the innermost loop, which matters more than the reduction it
@@ -59,37 +69,51 @@ static inline float f16_to_f32(uint16_t h) {
 #endif
 }
 
-/* Dot exactly ROWS output rows against one group of `gs` inputs, unscaled.
-   The x vectors are loaded once and reused across all ROWS.
+/* Dot exactly ROWS output rows against one group, unscaled.
 
    ROWS is a compile-time constant on purpose: with a runtime row count the
    compiler leaves a loop of unknown trip count in the innermost position and
    cannot unroll it, which measured 1.6x slower on both machines. */
+#if defined(__AVX2__)
+/* xq holds the group's inputs already permuted into evens-then-odds and
+   quantised to int16. Returns integer dot products. */
+static inline void group_rows_i16(const uint32_t *const w[ROWS], const int16_t *xq,
+                                  int words, int32_t dot[ROWS]) {
+    const __m256i m0F = _mm256_set1_epi8(0x0F);
+    __m256i a[ROWS];
+    for (int r = 0; r < ROWS; r++) a[r] = _mm256_setzero_si256();
+    for (int k = 0; k < words; k += 8) {          /* 32 bytes = 64 values */
+        const int16_t *xp = xq + 8 * k;
+        __m256i xa = _mm256_loadu_si256((const __m256i *)(xp));
+        __m256i xb = _mm256_loadu_si256((const __m256i *)(xp + 16));
+        __m256i xc = _mm256_loadu_si256((const __m256i *)(xp + 32));
+        __m256i xd = _mm256_loadu_si256((const __m256i *)(xp + 48));
+        for (int r = 0; r < ROWS; r++) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(w[r] + k));
+            __m256i lo = _mm256_and_si256(v, m0F);                      /* even values */
+            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0F);/* odd values  */
+            a[r] = _mm256_add_epi32(a[r], _mm256_madd_epi16(
+                _mm256_cvtepu8_epi16(_mm256_castsi256_si128(lo)), xa));
+            a[r] = _mm256_add_epi32(a[r], _mm256_madd_epi16(
+                _mm256_cvtepu8_epi16(_mm256_extracti128_si256(lo, 1)), xb));
+            a[r] = _mm256_add_epi32(a[r], _mm256_madd_epi16(
+                _mm256_cvtepu8_epi16(_mm256_castsi256_si128(hi)), xc));
+            a[r] = _mm256_add_epi32(a[r], _mm256_madd_epi16(
+                _mm256_cvtepu8_epi16(_mm256_extracti128_si256(hi, 1)), xd));
+        }
+    }
+    for (int r = 0; r < ROWS; r++) {
+        __m128i s = _mm_add_epi32(_mm256_castsi256_si128(a[r]),
+                                  _mm256_extracti128_si256(a[r], 1));
+        s = _mm_hadd_epi32(s, s); s = _mm_hadd_epi32(s, s);
+        dot[r] = _mm_cvtsi128_si32(s);
+    }
+}
+#else
 static inline void group_rows(const uint32_t *const w[ROWS], const float *x, int words,
                               float dot[ROWS]) {
     const int nrows = ROWS;
-#if defined(__AVX2__)
-    /* A variable shift per word. Unpacking through bytes instead (to dodge
-       vpsrlvd, which is 3 uops on Haswell) was tried and measured 1.3x slower
-       on the 2013 machine, so the obvious-looking micro-optimisation loses. */
-    const __m256i shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
-    const __m256i mask = _mm256_set1_epi32(0xF);
-    __m256 a[ROWS];
-    for (int r = 0; r < nrows; r++) a[r] = _mm256_setzero_ps();
-    for (int k = 0; k < words; k++) {
-        __m256 xv = _mm256_loadu_ps(x + 8 * k);
-        for (int r = 0; r < nrows; r++) {
-            __m256i q = _mm256_and_si256(
-                _mm256_srlv_epi32(_mm256_set1_epi32((int)w[r][k]), shifts), mask);
-            a[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q), xv, a[r]);
-        }
-    }
-    for (int r = 0; r < nrows; r++) {
-        __m128 lo = _mm_add_ps(_mm256_castps256_ps128(a[r]), _mm256_extractf128_ps(a[r], 1));
-        lo = _mm_hadd_ps(lo, lo); lo = _mm_hadd_ps(lo, lo);
-        dot[r] = _mm_cvtss_f32(lo);
-    }
-#elif defined(__ARM_NEON)
+#if defined(__ARM_NEON)
     const int32x4_t sh_lo = {0, -4, -8, -12}, sh_hi = {-16, -20, -24, -28};
     const uint32x4_t mask = vdupq_n_u32(0xF);
     float32x4_t a0[ROWS], a1[ROWS];
@@ -114,10 +138,11 @@ static inline void group_rows(const uint32_t *const w[ROWS], const float *x, int
     }
 #endif
 }
+#endif
 
 typedef struct {
     const uint32_t *w; const uint16_t *scales, *biases;
-    const float *x, *xsum; float *out;
+    const float *x, *xsum; const int16_t *xq; float xscale; float *out;
     int n_in, gs, row0, row1;
 } work_t;
 
@@ -142,7 +167,13 @@ static void do_work(const work_t *j) {
             const uint32_t *wg[ROWS];
             float dot[ROWS];
             for (int r = 0; r < ROWS; r++) wg[r] = wr[r] + g * wpg;
+#if defined(__AVX2__)
+            int32_t idot[ROWS];
+            group_rows_i16(wg, j->xq + g * gs, wpg, idot);
+            for (int r = 0; r < ROWS; r++) dot[r] = j->xscale * (float)idot[r];
+#else
             group_rows(wg, j->x + g * gs, wpg, dot);
+#endif
             for (int r = 0; r < ROWS; r++) {
                 size_t idx = (size_t)(o + r) * n_groups + g;
                 acc[r] += f16_to_f32(j->scales[idx]) * dot[r]
@@ -200,9 +231,13 @@ static void pool_init(void) {
 
 int q4_gemv(const uint32_t *w, const uint16_t *scales, const uint16_t *biases,
             const float *x, float *out, int n_out, int n_in, int gs, int nthreads) {
-    /* The AVX2 path consumes four words at a time, so a group must be a
-       multiple of 32 values. Every MLX group size in use (64, 128) is. */
+#if defined(__AVX2__)
+    /* 64 values are consumed per iteration there; every MLX group size in use
+       (64, 128) satisfies this. */
+    if (n_in % gs || gs % 64) return -1;
+#else
     if (n_in % gs || gs % 8) return -1;
+#endif
     pthread_once(&g_once, pool_init);
     const int n_groups = n_in / gs;
     float *xsum = (float *)alloca(sizeof(float) * n_groups);
@@ -211,6 +246,31 @@ int q4_gemv(const uint32_t *w, const uint16_t *scales, const uint16_t *biases,
         for (int i = 0; i < gs; i++) s += x[g * gs + i];
         xsum[g] = s;
     }
+
+    const int16_t *xq = NULL;
+    float xscale = 1.0f;
+#if defined(__AVX2__)
+    /* Reorder x into the order the nibble split produces -- within each block of
+       64, the even-indexed values then the odd ones -- and quantise to int16 so
+       the dot product can run through vpmaddwd. Both cost n_in operations,
+       against n_out*n_in/2 bytes of weights. */
+    int16_t *xqbuf = (int16_t *)alloca(sizeof(int16_t) * n_in);
+    float amax = 0.0f;
+    for (int i = 0; i < n_in; i++) { float v = x[i] < 0 ? -x[i] : x[i]; if (v > amax) amax = v; }
+    xscale = amax > 0.0f ? amax / 32767.0f : 1.0f;
+    const float inv = 1.0f / xscale;
+    for (int b = 0; b < n_in; b += 64) {
+        const float *src = x + b;
+        int16_t *dst = xqbuf + b;
+        for (int i = 0; i < 32; i++) {
+            float a0 = src[2 * i] * inv, a1 = src[2 * i + 1] * inv;
+            dst[i]      = (int16_t)(a0 < 0 ? a0 - 0.5f : a0 + 0.5f);
+            dst[32 + i] = (int16_t)(a1 < 0 ? a1 - 0.5f : a1 + 0.5f);
+        }
+    }
+    xq = xqbuf;
+#endif
+
     int n = nthreads > 0 ? nthreads : g_nthreads;
     if (n > g_nthreads) n = g_nthreads;
     /* Split on ROWS boundaries so blocks stay whole. */
@@ -222,12 +282,14 @@ int q4_gemv(const uint32_t *w, const uint16_t *scales, const uint16_t *biases,
         int r0 = t * per, r1 = r0 + per < n_out ? r0 + per : n_out;
         if (r0 >= n_out) { continue; }
         pthread_mutex_lock(&g_slot[t].mu);
-        g_slot[t].work = (work_t){w, scales, biases, x, xsum, out, n_in, gs, r0, r1};
+        g_slot[t].work = (work_t){w, scales, biases, x, xsum, xq, xscale, out,
+                                  n_in, gs, r0, r1};
         g_slot[t].has_work = 1; g_slot[t].finished = 0;
         pthread_cond_signal(&g_slot[t].go);
         pthread_mutex_unlock(&g_slot[t].mu);
     }
-    work_t mine = {w, scales, biases, x, xsum, out, n_in, gs, 0, per < n_out ? per : n_out};
+    work_t mine = {w, scales, biases, x, xsum, xq, xscale, out, n_in, gs, 0,
+                   per < n_out ? per : n_out};
     do_work(&mine);
     for (int t = 1; t < n; t++) {
         if (t * per >= n_out) continue;

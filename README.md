@@ -75,7 +75,7 @@ plan[latency, head on stage 0]   predicted 125.13 ms/token
   stage 0  M4 laptop   layers  0-13 (14)  0.52 GiB / 0.53 GiB  embed head
   stage 1  2013 Intel  layers 14-27 (14)  0.40 GiB / 0.53 GiB
 
-prompt 8 tok | TTFT 994 ms | 32 tokens | 8.07 tok/s
+prompt 57 tok | TTFT 3.0 s | 102 tokens | 9.27 tok/s
 ```
 
 Model is 0.81 GiB; each node was capped at 0.53 GiB, so neither could hold it.
@@ -111,10 +111,19 @@ weights to float32 at load moves eight times the bytes per token. The kernel in
 `kernel/q4gemv.c` unpacks into registers instead, with AVX2 and NEON paths:
 
 ```
-                          M4 (NEON, 8 thr)     2013 Intel (AVX2, 4 thr)
-NumPy float32 GEMV            0.81 ms                3.75 ms
-fused int4 GEMV               0.28 ms  (2.9x)        1.69 ms  (2.2x)
+one 8960x1536 projection      M4 (NEON)          2013 Intel (AVX2)
+NumPy float32 GEMV              0.81 ms              3.75 ms
+fused int4 GEMV, float          0.24 ms              1.41 ms
+fused int4 GEMV, int16 dot         -                 1.06 ms
 ```
+
+On AVX2 the dot product runs in 16-bit integers through `vpmaddwd`. Bisecting
+the loop stage by stage on the 2013 machine showed where the time went: a
+load-only pass sustains 10-11 GB/s, and adding just the nibble extract dropped
+it to 3.7 -- the per-word variable shift, not the arithmetic. Splitting a whole
+32-byte block with one shift and staying in 8- then 16-bit integers avoids both
+that and the integer-to-float conversion. `x` is quantised to int16 once per
+call, which costs relative error ~4e-5 and did not change the generated tokens.
 
 It matches the NumPy path to 3e-7 and generates identical tokens. The larger
 win is memory: weights stay packed, so a CPU node holds **8x more layers**.
