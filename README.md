@@ -89,6 +89,23 @@ backend. Pinning it to the last stage would have made the old Mac's head
 dominate everything. Instead the planner chooses, and when it picks stage 0 the
 ring returns hidden states rather than a token id.
 
+**Prefill needs a different kernel than decode.** With one row the operation is
+bandwidth-bound and the fused GEMV wins. With a whole prompt it is a real GEMM,
+which BLAS does far better — except BLAS cannot read 4-bit weights, and
+expanding them in NumPy costs ~150 ms per projection because every step
+allocates a temporary. `q4_dequant` does that expansion in one C pass into a
+reused 512-row buffer that stays in cache. Measured on the 2013 machine, one
+8960x1536 projection with a 57-row prompt:
+
+```
+NumPy dequant + BLAS   156.6 ms
+fused GEMV, row by row 100.7 ms
+C dequant + BLAS        51.8 ms
+```
+
+The crossover between the two paths is ~16 rows. End to end this took
+time-to-first-token on the pair from 13.0 s to 3.3 s.
+
 **A fused int4 GEMV, because decode is bandwidth-bound.** Dequantising 4-bit
 weights to float32 at load moves eight times the bytes per token. The kernel in
 `kernel/q4gemv.c` unpacks into registers instead, with AVX2 and NEON paths:

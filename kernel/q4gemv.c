@@ -237,3 +237,81 @@ int q4_gemv(const uint32_t *w, const uint16_t *scales, const uint16_t *biases,
     }
     return 0;
 }
+
+/* ---- block dequantisation, for prefill ------------------------------------
+ *
+ * With many rows of input the operation stops being bandwidth-bound and starts
+ * being a real GEMM, which BLAS does far better than a hand-rolled loop. What
+ * BLAS cannot do is read 4-bit weights, and doing that expansion in NumPy costs
+ * ~150 ms per projection because every step allocates a full temporary. Here it
+ * is one pass, into a caller-owned buffer sized to stay in cache.
+ */
+typedef struct {
+    const uint32_t *w; const uint16_t *scales, *biases;
+    float *out; int n_in, gs, row0, row1;
+} dq_t;
+
+static void dq_rows(const dq_t *j) {
+    const int gs = j->gs, n_groups = j->n_in / gs, wpg = gs / 8, wpr = j->n_in / 8;
+    for (int o = j->row0; o < j->row1; o++) {
+        const uint32_t *wr = j->w + (size_t)o * wpr;
+        float *dst = j->out + (size_t)(o - j->row0) * j->n_in;
+        for (int g = 0; g < n_groups; g++) {
+            const float sc = f16_to_f32(j->scales[(size_t)o * n_groups + g]);
+            const float bi = f16_to_f32(j->biases[(size_t)o * n_groups + g]);
+            const uint32_t *wg = wr + g * wpg;
+            float *d = dst + g * gs;
+#if defined(__AVX2__)
+            const __m256i shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+            const __m256i mask = _mm256_set1_epi32(0xF);
+            const __m256 sv = _mm256_set1_ps(sc), bv = _mm256_set1_ps(bi);
+            for (int k = 0; k < wpg; k++) {
+                __m256i q = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_set1_epi32((int)wg[k]), shifts), mask);
+                _mm256_storeu_ps(d + 8 * k,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(q), sv, bv));
+            }
+#elif defined(__ARM_NEON)
+            const int32x4_t sh_lo = {0, -4, -8, -12}, sh_hi = {-16, -20, -24, -28};
+            const uint32x4_t mask = vdupq_n_u32(0xF);
+            const float32x4_t sv = vdupq_n_f32(sc), bv = vdupq_n_f32(bi);
+            for (int k = 0; k < wpg; k++) {
+                uint32x4_t dw = vdupq_n_u32(wg[k]);
+                vst1q_f32(d + 8 * k, vfmaq_f32(bv,
+                    vcvtq_f32_u32(vandq_u32(vshlq_u32(dw, sh_lo), mask)), sv));
+                vst1q_f32(d + 8 * k + 4, vfmaq_f32(bv,
+                    vcvtq_f32_u32(vandq_u32(vshlq_u32(dw, sh_hi), mask)), sv));
+            }
+#else
+            for (int k = 0; k < wpg; k++)
+                for (int b = 0; b < 8; b++)
+                    d[8 * k + b] = (float)((wg[k] >> (4 * b)) & 0xF) * sc + bi;
+#endif
+        }
+    }
+}
+
+static void *dq_thread(void *arg) { dq_rows((const dq_t *)arg); return NULL; }
+
+/* Expand rows [row0,row1) into `out` as row-major float32 [row1-row0][n_in]. */
+int q4_dequant(const uint32_t *w, const uint16_t *scales, const uint16_t *biases,
+               float *out, int row0, int row1, int n_in, int gs, int nthreads) {
+    if (n_in % gs || gs % 8) return -1;
+    int rows = row1 - row0;
+    if (rows <= 0) return 0;
+    if (nthreads < 1) nthreads = 4;
+    if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
+    if (nthreads > rows) nthreads = rows;
+    pthread_t th[MAX_THREADS];
+    dq_t jobs[MAX_THREADS];
+    int per = (rows + nthreads - 1) / nthreads;
+    for (int t = 0; t < nthreads; t++) {
+        int a = row0 + t * per, b = a + per < row1 ? a + per : row1;
+        jobs[t] = (dq_t){w, scales, biases, out + (size_t)(a - row0) * n_in,
+                         n_in, gs, a, b < a ? a : b};
+    }
+    for (int t = 1; t < nthreads; t++) pthread_create(&th[t], NULL, dq_thread, &jobs[t]);
+    dq_rows(&jobs[0]);
+    for (int t = 1; t < nthreads; t++) pthread_join(th[t], NULL);
+    return 0;
+}

@@ -23,9 +23,11 @@ import numpy as np
 
 from .shard import ShardSpec, WeightIndex
 
-HEAD_BLOCK = 8192          # rows dequantised at a time on the GEMM path
-GEMV_ROWS_MAX = 48         # up to this many rows, loop the fused GEMV instead
-                           # (measured crossover against the dequant+BLAS path)
+HEAD_BLOCK = 512           # rows dequantised at a time on the GEMM path, sized
+                           # so the expanded block stays in cache
+# Below this many rows the fused GEMV loop wins; above it, expanding a block
+# and handing it to BLAS does. Measured crossover on both machines is ~16.
+GEMV_ROWS_MAX = int(os.environ.get("HETERO_GEMV_ROWS", "16"))
 
 
 def _load_kernel():
@@ -38,6 +40,8 @@ def _load_kernel():
     lib = ctypes.CDLL(so)
     lib.q4_gemv.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4
     lib.q4_gemv.restype = ctypes.c_int
+    lib.q4_dequant.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 5
+    lib.q4_dequant.restype = ctypes.c_int
     return lib
 
 
@@ -113,13 +117,30 @@ class QLinear:
         return out
 
     def _gemm(self, flat: np.ndarray) -> np.ndarray:
+        """Expand a block of rows in C, then let BLAS multiply.
+
+        NumPy's own dequantisation allocates a temporary per step and costs more
+        than the matmul it feeds; doing it in one C pass into a reused,
+        cache-sized buffer is what makes prefill affordable on a CPU node.
+        """
         out = np.empty((flat.shape[0], self.n_out), dtype=np.float32)
+        buf = self._buf(HEAD_BLOCK)
         for lo in range(0, self.n_out, HEAD_BLOCK):
             hi = min(lo + HEAD_BLOCK, self.n_out)
-            blk = dequantize(self.w[lo:hi], self.scales[lo:hi], self.biases[lo:hi],
-                             self.group_size, self.bits)
-            out[:, lo:hi] = flat @ blk.T
+            rc = KERNEL.q4_dequant(self.w.ctypes.data, self.scales.ctypes.data,
+                                   self.biases.ctypes.data, buf.ctypes.data,
+                                   lo, hi, self.n_in, self.group_size, NTHREADS)
+            if rc != 0:
+                raise RuntimeError(f"q4_dequant failed with {rc}")
+            out[:, lo:hi] = flat @ buf[:hi - lo].T
         return out
+
+    def _buf(self, rows: int) -> np.ndarray:
+        b = getattr(self, "_scratch", None)
+        if b is None or b.shape != (rows, self.n_in):
+            b = np.empty((rows, self.n_in), dtype=np.float32)
+            self._scratch = b
+        return b
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         flat = np.asarray(x, dtype=np.float32).reshape(-1, x.shape[-1])
