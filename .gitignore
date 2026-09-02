@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
+.venv/
+
+# built kernel
+kernel/*.so
+*.o
+
 .DS_Store

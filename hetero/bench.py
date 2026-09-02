@@ -131,9 +131,11 @@ def single_node_bench(model: str, warmup: int = 8, measure: int = 48,
     """
     import mlx.core as mx
     from transformers import AutoTokenizer
+    from . import backends
     from .engine import Sampler
     from .model import KVCache, load_stage
     from .shard import ShardSpec, WeightIndex, snapshot_dir
+    backend = backends.get("mlx")
 
     d = snapshot_dir(model)
     index = WeightIndex(d)
@@ -147,17 +149,17 @@ def single_node_bench(model: str, warmup: int = 8, measure: int = 48,
     sampler = Sampler(0.0)
 
     y = stage(mx.array([ids]), caches, last_only=True)
-    last = int(sampler(y[:, -1, :]).item())
+    last = sampler(y[:, -1, :], backend)
     text = [last]
     for _ in range(warmup):
         y = stage(mx.array([[last]]), caches, last_only=True)
-        last = int(sampler(y[:, -1, :]).item())
+        last = sampler(y[:, -1, :], backend)
         text.append(last)
     mx.synchronize()
     t0 = time.perf_counter()
     for _ in range(measure):
         y = stage(mx.array([[last]]), caches, last_only=True)
-        last = int(sampler(y[:, -1, :]).item())
+        last = sampler(y[:, -1, :], backend)
         text.append(last)
     mx.synchronize()
     wall = time.perf_counter() - t0
@@ -170,7 +172,7 @@ def single_node_bench(model: str, warmup: int = 8, measure: int = 48,
         # compare against; keep going (untimed) until the sequence is long enough.
         while len(text) < max_tokens:
             y = stage(mx.array([[last]]), caches, last_only=True)
-            last = int(sampler(y[:, -1, :]).item())
+            last = sampler(y[:, -1, :], backend)
             text.append(last)
         seq = text[:max_tokens]
         out["text"] = tok.decode(seq)

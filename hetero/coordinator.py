@@ -218,6 +218,12 @@ class Coordinator:
         from .engine import StageStats
         self.runner.stats = StageStats()
         self.data_out.send({"t": "reset"})
+        # Wait for it to come back around, or the stages zero their counters
+        # partway through the measurement that follows.
+        while True:
+            h, _ = self.data_in.recv(timeout=60)
+            if h.get("t") == "reset":
+                break
         self.data_out_reset_bytes = self.data_out.stats()["bytes_sent"]
 
     def recv_token(self, timeout: float = 600):
@@ -230,6 +236,8 @@ class Coordinator:
             h, p = self.data_in.recv(timeout=timeout)
             if h.get("t") == "tok":
                 return h["req"], h["tok"]
+            if h.get("t") in ("reset", "free"):
+                continue          # control frames complete the ring; not tokens
             if h.get("t") == "fwd":
                 if not self.head_local:
                     raise RuntimeError("hidden state returned but no head on stage 0")
